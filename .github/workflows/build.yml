@@ -25,6 +25,12 @@ jobs:
         with:
           gradle-version: '8.14'
 
+      - name: Preserve debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: gpt-web-native-debug-keystore-v1
+
       - name: Build release APK
         run: gradle :app:assembleRelease --stacktrace
 
