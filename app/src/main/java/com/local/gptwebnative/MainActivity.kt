@@ -7,11 +7,16 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Bitmap
+import android.graphics.drawable.ColorDrawable
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Message
+import android.os.SystemClock
+import android.util.Log
 import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
@@ -21,6 +26,9 @@ import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceError
+import android.webkit.WebResourceResponse
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -29,6 +37,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.TextView
+import android.widget.ProgressBar
 import android.widget.Toast
 
 class MainActivity : Activity() {
@@ -61,24 +71,132 @@ class MainActivity : Activity() {
     private var pendingWebPermission: PermissionRequest? = null
     private var pendingWebResources: Array<String> = emptyArray()
 
+    private val preferences by lazy { getSharedPreferences("resume_state", Context.MODE_PRIVATE) }
+    private var pageColor = Color.WHITE
+    private var darkPage = false
+    private var mainWebViewAlive = true
+    private var loadFailed = false
+    private var pageStartedAt = 0L
+    private var navigationGeneration = 0L
+    private lateinit var loadingView: TextView
+    private lateinit var progressView: ProgressBar
+    private val slowLoad = Runnable {
+        if (!isDestroyed && loadingView.visibility == View.VISIBLE && !loadFailed) {
+            showLoadMessage("Still loading. Tap to retry.")
+        }
+    }
+
+    // Event names and timing only: never log URLs, cookies, page text or titles.
+    private fun trace(event: String) {
+        Log.i("GptWebLifecycle", "${SystemClock.elapsedRealtime()} $event")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        trace(if (savedInstanceState == null) "activity_create_fresh" else "activity_create_restore")
+        darkPage = preferences.getBoolean("dark", resources.configuration.uiMode and
+            Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES)
+        pageColor = preferences.getInt("color", if (darkPage) Color.rgb(33, 33, 33) else Color.WHITE)
+        window.setBackgroundDrawable(ColorDrawable(pageColor))
 
         configureEdgeToEdge()
         buildViewHierarchy()
         configureMainWebView(webView)
         configureInsets()
-
-        if (savedInstanceState == null) {
-            webView.loadUrl(HOME_URL)
-        } else {
-            webView.restoreState(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT
+            ) { handleBack() }
         }
+
+        updateSystemBarIconAppearance(darkPage)
+        val restored = savedInstanceState?.let { webView.restoreState(it) }
+        if (restored == null || restored.size == 0) webView.loadUrl(resumeUrl())
+        loadingView.postDelayed(slowLoad, 15000)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        webView.saveState(outState)
+        if (mainWebViewAlive) webView.saveState(outState)
         super.onSaveInstanceState(outState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        trace("activity_resume")
+        if (mainWebViewAlive) webView.onResume()
+    }
+
+    override fun onPause() {
+        if (mainWebViewAlive) {
+            rememberPage(webView.url)
+            webView.onPause()
+        }
+        trace("activity_pause")
+        super.onPause()
+    }
+
+    override fun onStop() {
+        trace("activity_stop")
+        super.onStop()
+    }
+
+    private fun restorableUrl(raw: String?): String? {
+        val uri = raw?.let(Uri::parse) ?: return null
+        if (uri.scheme != "https" || uri.host != "chatgpt.com" ||
+            uri.userInfo != null || uri.port !in listOf(-1, 443)) return null
+        val path = uri.path ?: "/"
+        // Save only home/conversation routes, never OAuth codes or temporary-chat flags.
+        if (uri.getQueryParameter("temporary-chat") == "true") return HOME_URL
+        if (path != "/" && !Regex("^/(?:g/[A-Za-z0-9_-]+/)?c/[A-Za-z0-9_-]+/?$").matches(path)) return null
+        return uri.buildUpon().clearQuery().fragment(null).build().toString()
+    }
+
+    private fun resumeUrl(): String =
+        restorableUrl(preferences.getString("url", HOME_URL)) ?: HOME_URL
+
+    private fun rememberPage(raw: String?) {
+        val uri = raw?.let(Uri::parse) ?: return
+        if (uri.host == "chatgpt.com" && uri.path.orEmpty().startsWith("/auth/")) {
+            preferences.edit().remove("url").apply()
+            return
+        }
+        val url = restorableUrl(raw) ?: return
+        if (preferences.getString("url", null) != url) preferences.edit().putString("url", url).apply()
+    }
+
+    private fun showLoadMessage(message: String) {
+        loadingView.animate().cancel()
+        loadingView.alpha = 1f
+        loadingView.text = message
+        loadingView.visibility = View.VISIBLE
+        loadingView.isClickable = true
+        loadingView.setOnClickListener { retryPage() }
+    }
+
+    private fun retryPage() {
+        trace("retry")
+        if (!mainWebViewAlive) {
+            webView = WebView(this).apply {
+                setBackgroundColor(pageColor)
+                layoutParams = FrameLayout.LayoutParams(-1, -1)
+            }
+            mainWebViewAlive = true
+            configureMainWebView(webView)
+            root.addView(webView, 0)
+            root.requestApplyInsets()
+            webView.loadUrl(resumeUrl())
+        } else {
+            webView.reload()
+        }
+    }
+
+    private fun revealPage() {
+        if (loadFailed) return
+        loadingView.removeCallbacks(slowLoad)
+        // Keep the live WebView visible during subsequent conversation navigation.
+        loadingView.visibility = View.GONE
+        trace("page_visible")
     }
 
     private fun configureEdgeToEdge() {
@@ -98,11 +216,11 @@ class MainActivity : Activity() {
 
     private fun buildViewHierarchy() {
         root = FrameLayout(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(pageColor)
         }
 
         webView = WebView(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(pageColor)
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -110,7 +228,7 @@ class MainActivity : Activity() {
         }
 
         statusScrim = View(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(pageColor)
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0
@@ -118,7 +236,7 @@ class MainActivity : Activity() {
         }
 
         navigationScrim = View(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(pageColor)
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0
@@ -128,6 +246,20 @@ class MainActivity : Activity() {
         root.addView(webView)
         root.addView(statusScrim)
         root.addView(navigationScrim)
+        loadingView = TextView(this).apply {
+            text = "Loading…"
+            gravity = android.view.Gravity.CENTER
+            setBackgroundColor(pageColor)
+            setTextColor(if (darkPage) Color.WHITE else Color.DKGRAY)
+            layoutParams = FrameLayout.LayoutParams(-1, -1)
+        }
+        progressView = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            visibility = View.GONE
+            layoutParams = FrameLayout.LayoutParams(-1, (2 * resources.displayMetrics.density).toInt())
+        }
+        root.addView(loadingView)
+        root.addView(progressView)
         setContentView(root)
     }
 
@@ -174,6 +306,15 @@ class MainActivity : Activity() {
                 (navigationScrim.layoutParams as FrameLayout.LayoutParams).apply {
                     height = bottom
                 }
+            (loadingView.layoutParams as FrameLayout.LayoutParams).apply {
+                topMargin = top
+                bottomMargin = contentBottom
+                loadingView.layoutParams = this
+            }
+            (progressView.layoutParams as FrameLayout.LayoutParams).apply {
+                topMargin = top
+                progressView.layoutParams = this
+            }
             insets
         }
         root.requestApplyInsets()
@@ -190,6 +331,56 @@ class MainActivity : Activity() {
         view.addJavascriptInterface(PageUiBridge(), "NativeUi")
 
         view.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                navigationGeneration++
+                loadFailed = false
+                pageStartedAt = SystemClock.elapsedRealtime()
+                trace("main_document_start")
+                if (loadingView.visibility == View.VISIBLE) {
+                    loadingView.text = "Loading…"
+                    loadingView.isClickable = false
+                    loadingView.removeCallbacks(slowLoad)
+                    loadingView.postDelayed(slowLoad, 15000)
+                }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+                rememberPage(url)
+                trace(if (isReload) "history_reload" else "history_update")
+            }
+
+            override fun onPageCommitVisible(view: WebView, url: String) {
+                revealPage()
+            }
+
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (!request.isForMainFrame) return
+                loadFailed = true
+                loadingView.removeCallbacks(slowLoad)
+                progressView.visibility = View.GONE
+                trace("main_document_error_${error.errorCode}")
+                showLoadMessage("Unable to load page. Check your connection and tap to retry.")
+            }
+
+            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                if (request.isForMainFrame) trace("main_http_${response.statusCode}")
+                // Preserve server-rendered sign-in/challenge/error pages.
+            }
+
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                trace(if (detail.didCrash()) "renderer_crash" else "renderer_reclaimed")
+                mainWebViewAlive = false
+                pendingWebPermission = null
+                pendingWebResources = emptyArray()
+                fileChooserCallback = null
+                root.removeView(view)
+                view.destroy()
+                loadingView.removeCallbacks(slowLoad)
+                progressView.visibility = View.GONE
+                showLoadMessage("Page was closed by Android. Tap to reopen.")
+                return true
+            }
+
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest
@@ -202,6 +393,15 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                trace("main_document_finish_${SystemClock.elapsedRealtime() - pageStartedAt}ms")
+                rememberPage(url)
+                val generation = navigationGeneration
+                view.postVisualStateCallback(generation, object : WebView.VisualStateCallback() {
+                    override fun onComplete(requestId: Long) {
+                        if (!isDestroyed && mainWebViewAlive && view === webView &&
+                            requestId == navigationGeneration) revealPage()
+                    }
+                })
                 if (isInternalHttpUrl(Uri.parse(url))) {
                     installPageAppearanceObserver(view)
                 }
@@ -209,6 +409,11 @@ class MainActivity : Activity() {
         }
 
         view.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                progressView.progress = newProgress
+                progressView.visibility = if (!loadFailed && newProgress in 1..99) View.VISIBLE else View.GONE
+            }
+
             override fun onShowFileChooser(
                 webView: WebView,
                 filePathCallback: ValueCallback<Array<Uri>>,
@@ -312,6 +517,13 @@ class MainActivity : Activity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(popup, true)
 
         popup.webViewClient = object : WebViewClient() {
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                trace("popup_renderer_gone")
+                if (popupWebView === view) popupWebView = null
+                root.removeView(view)
+                view.destroy()
+                return true
+            }
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest
@@ -517,7 +729,8 @@ class MainActivity : Activity() {
               window.__gptNativeThemeObserverInstalled = true;
 
               function parseColor(input) {
-                var m = String(input || '').match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
+                if (!input || input === 'transparent' || /^rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(input)) return null;
+                var m = String(input).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
                 if (!m) return null;
                 var r = parseInt(m[1]), g = parseInt(m[2]), b = parseInt(m[3]);
                 var hex = '#' + [r,g,b].map(function(v){ return v.toString(16).padStart(2,'0'); }).join('');
@@ -563,12 +776,22 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun setPageBackground(color: String, dark: Boolean) {
             runOnUiThread {
+                if (isDestroyed || !mainWebViewAlive) return@runOnUiThread
                 val parsed = try {
                     Color.parseColor(color)
                 } catch (_: Exception) {
                     if (dark) Color.rgb(33, 33, 33) else Color.WHITE
                 }
                 root.setBackgroundColor(parsed)
+                pageColor = parsed
+                darkPage = dark
+                if (mainWebViewAlive) webView.setBackgroundColor(parsed)
+                window.setBackgroundDrawable(ColorDrawable(parsed))
+                loadingView.setBackgroundColor(parsed)
+                loadingView.setTextColor(if (dark) Color.WHITE else Color.DKGRAY)
+                if (preferences.getInt("color", 0) != parsed || preferences.getBoolean("dark", !dark) != dark) {
+                    preferences.edit().putInt("color", parsed).putBoolean("dark", dark).apply()
+                }
                 statusScrim.setBackgroundColor(parsed)
                 navigationScrim.setBackgroundColor(parsed)
                 updateSystemBarIconAppearance(dark)
@@ -605,21 +828,30 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
+        handleBack()
+    }
+
+    private fun handleBack() {
         when {
             popupWebView != null -> closePopup()
-            webView.canGoBack() -> webView.goBack()
-            else -> super.onBackPressed()
+            mainWebViewAlive && webView.canGoBack() -> webView.goBack()
+            else -> moveTaskToBack(true)
         }
     }
 
     override fun onDestroy() {
+        trace("activity_destroy")
+        loadingView.removeCallbacks(slowLoad)
         pendingWebPermission?.deny()
         pendingWebPermission = null
         fileChooserCallback?.onReceiveValue(null)
         fileChooserCallback = null
         closePopup()
-        webView.stopLoading()
-        webView.destroy()
+        if (mainWebViewAlive) {
+            webView.stopLoading()
+            webView.destroy()
+            mainWebViewAlive = false
+        }
         super.onDestroy()
     }
 }
