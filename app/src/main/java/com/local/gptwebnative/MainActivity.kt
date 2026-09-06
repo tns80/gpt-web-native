@@ -146,12 +146,26 @@ class MainActivity : Activity() {
                 bottom = insets.systemWindowInsetBottom
             }
 
+            val contentBottom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                maxOf(bottom, insets.getInsets(WindowInsets.Type.ime()).bottom)
+            } else {
+                bottom
+            }
+
             (webView.layoutParams as FrameLayout.LayoutParams).apply {
                 // Draw the WebView behind the transparent status bar.
                 // ChatGPT already handles its own top safe area.
                 topMargin = 0
-                bottomMargin = bottom
+                bottomMargin = contentBottom
                 webView.layoutParams = this
+            }
+
+            popupWebView?.let { popup ->
+                val params = popup.layoutParams as FrameLayout.LayoutParams
+                if (params.bottomMargin != contentBottom) {
+                    params.bottomMargin = contentBottom
+                    popup.layoutParams = params
+                }
             }
             statusScrim.layoutParams = (statusScrim.layoutParams as FrameLayout.LayoutParams).apply {
                 height = top
@@ -314,7 +328,8 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ).apply {
-            val currentBottom = navigationScrim.layoutParams.height
+            val currentBottom =
+                (webView.layoutParams as FrameLayout.LayoutParams).bottomMargin
             topMargin = 0
             bottomMargin = currentBottom
         }
