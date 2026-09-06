@@ -72,6 +72,9 @@ class MainActivity : Activity() {
     private var pendingWebResources: Array<String> = emptyArray()
 
     private val preferences by lazy { getSharedPreferences("resume_state", Context.MODE_PRIVATE) }
+    private val homeBannerScript by lazy {
+        assets.open("home-banner.js").bufferedReader().use { it.readText() }
+    }
     private var pageColor = Color.WHITE
     private var darkPage = false
     private var mainWebViewAlive = true
@@ -346,6 +349,7 @@ class MainActivity : Activity() {
 
             override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
                 rememberPage(url)
+                applyHomeBannerRule(view, url)
                 trace(if (isReload) "history_reload" else "history_update")
             }
 
@@ -393,6 +397,7 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                applyHomeBannerRule(view, url)
                 trace("main_document_finish_${SystemClock.elapsedRealtime() - pageStartedAt}ms")
                 rememberPage(url)
                 val generation = navigationGeneration
@@ -718,6 +723,13 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Downloading $filename", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun applyHomeBannerRule(view: WebView, url: String) {
+        val uri = Uri.parse(url)
+        if (uri.scheme == "https" && uri.host == "chatgpt.com" && uri.port in listOf(-1, 443)) {
+            view.evaluateJavascript(homeBannerScript, null)
         }
     }
 

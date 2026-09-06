@@ -4,3 +4,7 @@ local.properties
 **/build/
 *.iml
 .DS_Store
+*.keystore
+*.jks
+*.p12
+*signing-private*.json

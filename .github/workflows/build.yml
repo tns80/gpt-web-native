@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,18 +28,44 @@ jobs:
         with:
           gradle-version: '8.14'
 
-      - name: Preserve debug signing key
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: gpt-web-native-debug-keystore-v1
+      - name: Restore persistent signing key
+        env:
+          RELEASE_SIGNING_JSON: ${{ secrets.RELEASE_SIGNING_JSON }}
+        run: |
+          python3 - <<'PY'
+          import os, json, base64, pathlib, re
+          raw = os.environ.get('RELEASE_SIGNING_JSON', '')
+          if not raw:
+              raise SystemExit('Missing RELEASE_SIGNING_JSON. Run tools/configure_signing.py first.')
+          bundle = json.loads(raw)
+          password = bundle['password']
+          if not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', password):
+              raise SystemExit('Invalid signing bundle format.')
+          print('::add-mask::' + password)
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gptwebnative-release.p12'
+          path.touch(mode=0o600, exist_ok=False)
+          path.write_bytes(base64.b64decode(bundle['keystore'], validate=True))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('RELEASE_STORE_FILE=' + str(path) + '\n')
+              output.write('RELEASE_STORE_PASSWORD=' + password + '\n')
+          PY
 
       - name: Build release APK
         run: gradle :app:assembleRelease --stacktrace
+
+      - name: Record public signing certificate
+        run: |
+          keytool -list -v -keystore "$RELEASE_STORE_FILE" -storetype PKCS12 -storepass:env RELEASE_STORE_PASSWORD -alias gptwebnative > app/build/outputs/apk/release/signing-certificate.txt
+
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gptwebnative-release.p12"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: gpt-web-native-release
-          path: app/build/outputs/apk/release/app-release.apk
+          path: |
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/release/signing-certificate.txt
           if-no-files-found: error
